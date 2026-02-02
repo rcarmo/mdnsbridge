@@ -9,11 +9,11 @@ This is handy when you want Bonjour names to work over Tailscale using **split-h
 Tailscale clients can’t see mDNS broadcasts on your LAN. Run `mdnsbridge` on an exit node (or subnet router) that *can* see the LAN, and point Tailscale’s split DNS for `local` at it.
 
 ```plain
-┌─────────────────┐     DNS query      ┌─────────────────┐    mDNS query    ┌─────────────────┐
-│ Tailscale       │ ──────────────────▶│ mdnsbridge      │ ────────────────▶│ LAN device      │
-│ client          │    printer.local   │ (exit node)     │   printer.local  │ (printer/NAS)   │
-│                 │ ◀──────────────────│                 │ ◀────────────────│                 │
-└─────────────────┘     192.168.1.50   └─────────────────┘    192.168.1.50  └─────────────────┘
+┌───────────┐     DNS query      ┌─────────────┐    mDNS query    ┌───────────────┐
+│ Tailscale │ ──────────────────▶│ mdnsbridge  │ ────────────────▶│ LAN device    │
+│ client    │    printer.local   │ (exit node) │   printer.local  │ (printer/NAS) │
+│           │ ◀──────────────────│             │ ◀────────────────│               │
+└───────────┘     192.168.1.50   └─────────────┘    192.168.1.50  └───────────────┘
 ```
 
 ## Build

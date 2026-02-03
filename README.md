@@ -64,6 +64,7 @@ ping printer.local
 - Needs `avahi-daemon` and `avahi-resolve` (`avahi-tools` / `avahi-utils`).
 - Listens on `:53` by default (UDP + TCP). Use `-addr` if you want another port.
 - Caches results briefly (positive 5s, negative 2s).
+- Runs `avahi-browse` on startup and every 5 minutes to refresh Avahi.
 
 ## License
 

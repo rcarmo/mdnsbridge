@@ -21,6 +21,7 @@ import (
 const (
 	positiveCacheTTL        = 5 * time.Second
 	negativeCacheTTL        = 2 * time.Second
+	avahiRefreshInterval    = 5 * time.Minute
 	responseTTL      uint32 = 10
 	resolveTimeout          = 500 * time.Millisecond
 	resolveAttempts         = 3
@@ -216,6 +217,19 @@ func warmUpAvahi(ctx context.Context) {
 	}
 }
 
+func periodicWarmUpAvahi(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			warmUpAvahi(ctx)
+		}
+	}
+}
+
 func main() {
 	addr := flag.String("addr", ":53", "listen address (udp and tcp)")
 	warm := flag.Bool("warmup", true, "run avahi-browse warmup")
@@ -223,8 +237,12 @@ func main() {
 
 	dns.HandleFunc(".", handleDNS)
 
+	warmCtx, cancelWarm := context.WithCancel(context.Background())
+	defer cancelWarm()
+
 	if *warm {
-		go warmUpAvahi(context.Background())
+		go warmUpAvahi(warmCtx)
+		go periodicWarmUpAvahi(warmCtx, avahiRefreshInterval)
 	}
 
 	udpServer := &dns.Server{Addr: *addr, Net: "udp", ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
@@ -248,6 +266,7 @@ func main() {
 	select {
 	case sig := <-sigCh:
 		log.Printf("Received signal %s, shutting down", sig)
+		cancelWarm()
 		if err := udpServer.Shutdown(); err != nil {
 			log.Printf("udp shutdown error: %v", err)
 		}
@@ -255,6 +274,7 @@ func main() {
 			log.Printf("tcp shutdown error: %v", err)
 		}
 	case err := <-errCh:
+		cancelWarm()
 		log.Fatalf("server error: %v", err)
 	}
 }

@@ -6,7 +6,7 @@ This is handy when you want Bonjour names to work over Tailscale using **split-h
 
 ## What it does
 
-Tailscale clients can’t see mDNS broadcasts on your LAN. Run `mdnsbridge` on an exit node (or subnet router) that *can* see the LAN, and point Tailscale’s split DNS for `local` at it.
+Tailscale clients can’t see mDNS broadcasts on your LAN. Run `mdnsbridge` on an exit node (or subnet router) that _can_ see the LAN, and point Tailscale’s split DNS for `local` at it.
 
 ```plain
 ┌───────────┐    DNS query      ┌─────────────┐    mDNS query   ┌───────────────┐
@@ -54,8 +54,8 @@ In the Tailscale admin console:
 1. Open **Admin Console → DNS**.
 2. Under **Nameservers**, choose **Split DNS**.
 3. Add a rule:
-	- **Domain:** `local`
-	- **Nameserver:** the *Tailscale IP* of the machine running `mdnsbridge` (e.g. `100.64.0.5`)
+   - **Domain:** `local`
+   - **Nameserver:** the _Tailscale IP_ of the machine running `mdnsbridge` (e.g. `100.64.0.5`)
 4. Save. That’s it.
 
 On Linux clients, ensure they accept DNS from Tailscale:
@@ -74,7 +74,12 @@ ping printer.local
 ## Notes
 
 - Needs `avahi-daemon` and `avahi-resolve` (`avahi-tools` / `avahi-utils`).
-- Listens on `:53` by default (UDP + TCP). Use `-addr` if you want another port (useful for testing)
+- Listens on IPv4 `:53` and IPv6 `[::]:53` by default (UDP + TCP).
+- Use `-addr4` or `-addr6` to override or disable a family (set empty to disable).
+- `-addr` is deprecated; it maps to `-addr4` for backward compatibility.
+- Examples:
+  - IPv4 only: `mdnsbridge -addr6 ""`
+  - IPv6 only: `mdnsbridge -addr4 ""`
 - Caches results briefly (positive 5s, negative 2s).
 - Runs `avahi-browse` on startup and every 5 minutes to refresh `avahi-daemon`.
 

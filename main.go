@@ -19,12 +19,12 @@ import (
 )
 
 const (
-	positiveCacheTTL        = 5 * time.Second
-	negativeCacheTTL        = 2 * time.Second
-	avahiRefreshInterval    = 5 * time.Minute
-	responseTTL      uint32 = 10
-	resolveTimeout          = 500 * time.Millisecond
-	resolveAttempts         = 3
+	positiveCacheTTL            = 5 * time.Second
+	negativeCacheTTL            = 2 * time.Second
+	avahiRefreshInterval        = 5 * time.Minute
+	responseTTL          uint32 = 10
+	resolveTimeout              = 500 * time.Millisecond
+	resolveAttempts             = 3
 )
 
 type cacheEntry struct {
@@ -87,8 +87,6 @@ func pickIP(out string, qtype uint16) net.IP {
 			if ip.To4() == nil {
 				return ip
 			}
-		default:
-			return ip
 		}
 	}
 	return nil
@@ -136,12 +134,16 @@ func resolveMDNS(ctx context.Context, name string, qtype uint16) (net.IP, error)
 }
 
 func cachedResolve(name string, qtype uint16) (net.IP, error) {
+	return cachedResolveCtx(context.Background(), name, qtype)
+}
+
+func cachedResolveCtx(ctx context.Context, name string, qtype uint16) (net.IP, error) {
 	key := cacheKey(name, qtype)
 	if ip, err, ok := cache.get(key); ok {
 		return ip, err
 	}
 
-	ip, err := resolveMDNS(context.Background(), name, qtype)
+	ip, err := resolveMDNS(ctx, name, qtype)
 	if err != nil {
 		cache.set(key, nil, err, negativeCacheTTL)
 		return nil, err
@@ -151,6 +153,20 @@ func cachedResolve(name string, qtype uint16) (net.IP, error) {
 	return ip, nil
 }
 
+func recordForIP(name string, qtype uint16, ip net.IP) (dns.RR, bool) {
+	switch qtype {
+	case dns.TypeA:
+		if a4 := ip.To4(); a4 != nil {
+			return &dns.A{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: responseTTL}, A: a4}, true
+		}
+	case dns.TypeAAAA:
+		if ip6 := ip.To16(); ip6 != nil {
+			return &dns.AAAA{Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: responseTTL}, AAAA: ip6}, true
+		}
+	}
+	return nil, false
+}
+
 func addRecordForQuery(msg *dns.Msg, q dns.Question) bool {
 	ip, err := cachedResolve(q.Name, q.Qtype)
 	if err != nil {
@@ -158,24 +174,12 @@ func addRecordForQuery(msg *dns.Msg, q dns.Question) bool {
 		return false
 	}
 
-	switch q.Qtype {
-	case dns.TypeA:
-		a := &dns.A{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: responseTTL}, A: ip.To4()}
-		if a.A == nil {
-			return false
-		}
-		msg.Answer = append(msg.Answer, a)
-		return true
-	case dns.TypeAAAA:
-		aaaa := &dns.AAAA{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: responseTTL}, AAAA: ip.To16()}
-		if aaaa.AAAA == nil {
-			return false
-		}
-		msg.Answer = append(msg.Answer, aaaa)
-		return true
-	default:
+	rr, ok := recordForIP(q.Name, q.Qtype, ip)
+	if !ok {
 		return false
 	}
+	msg.Answer = append(msg.Answer, rr)
+	return true
 }
 
 func handleDNS(w dns.ResponseWriter, r *dns.Msg) {
@@ -192,8 +196,36 @@ func handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 		case dns.TypeANY:
 			a := dns.Question{Name: q.Name, Qtype: dns.TypeA, Qclass: q.Qclass}
 			aaaa := dns.Question{Name: q.Name, Qtype: dns.TypeAAAA, Qclass: q.Qclass}
-			okA := addRecordForQuery(msg, a)
-			okAAAA := addRecordForQuery(msg, aaaa)
+			// resolve A and AAAA in parallel
+			var okA, okAAAA bool
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			resolveCtx, cancel := context.WithTimeout(context.Background(), resolveTimeout*time.Duration(resolveAttempts))
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				if ip, err := cachedResolveCtx(resolveCtx, a.Name, a.Qtype); err == nil {
+					if rr, ok := recordForIP(a.Name, a.Qtype, ip); ok {
+						mu.Lock()
+						msg.Answer = append(msg.Answer, rr)
+						okA = true
+						mu.Unlock()
+					}
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				if ip, err := cachedResolveCtx(resolveCtx, aaaa.Name, aaaa.Qtype); err == nil {
+					if rr, ok := recordForIP(aaaa.Name, aaaa.Qtype, ip); ok {
+						mu.Lock()
+						msg.Answer = append(msg.Answer, rr)
+						okAAAA = true
+						mu.Unlock()
+					}
+				}
+			}()
+			wg.Wait()
+			cancel()
 			if okA || okAAAA {
 				answered = true
 			}
@@ -230,8 +262,26 @@ func periodicWarmUpAvahi(ctx context.Context, interval time.Duration) {
 	}
 }
 
+func newUDPServer(addr string, network string) (*dns.Server, error) {
+	pc, err := net.ListenPacket(network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return &dns.Server{Addr: addr, Net: network, PacketConn: pc, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}, nil
+}
+
+func newTCPServer(addr string, network string) (*dns.Server, error) {
+	ln, err := net.Listen(network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return &dns.Server{Addr: addr, Net: network, Listener: ln, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}, nil
+}
+
 func main() {
-	addr := flag.String("addr", ":53", "listen address (udp and tcp)")
+	addrLegacy := flag.String("addr", "", "(deprecated) listen address for IPv4 (udp4/tcp4)")
+	addr4 := flag.String("addr4", ":53", "listen address for IPv4 (udp4/tcp4); empty disables IPv4")
+	addr6 := flag.String("addr6", "[::]:53", "listen address for IPv6 (udp6/tcp6); empty disables IPv6")
 	warm := flag.Bool("warmup", true, "run avahi-browse warmup")
 	flag.Parse()
 
@@ -245,36 +295,87 @@ func main() {
 		go periodicWarmUpAvahi(warmCtx, avahiRefreshInterval)
 	}
 
-	udpServer := &dns.Server{Addr: *addr, Net: "udp", ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
-	tcpServer := &dns.Server{Addr: *addr, Net: "tcp", ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}
+	type serverEntry struct {
+		server *dns.Server
+		label  string
+	}
 
-	errCh := make(chan error, 2)
+	if *addrLegacy != "" {
+		*addr4 = *addrLegacy
+	}
 
-	go func() {
-		log.Printf("Starting DNS → mDNS bridge on %s (udp)", *addr)
-		errCh <- udpServer.ListenAndServe()
-	}()
+	var servers []serverEntry
 
-	go func() {
-		log.Printf("Starting DNS → mDNS bridge on %s (tcp)", *addr)
-		errCh <- tcpServer.ListenAndServe()
-	}()
+	// IPv4 listeners
+	if *addr4 != "" {
+		if udp4, err := newUDPServer(*addr4, "udp4"); err != nil {
+			log.Printf("udp4 listen failed on %s: %v", *addr4, err)
+		} else {
+			servers = append(servers, serverEntry{udp4, "udp4"})
+		}
+		if tcp4, err := newTCPServer(*addr4, "tcp4"); err != nil {
+			log.Printf("tcp4 listen failed on %s: %v", *addr4, err)
+		} else {
+			servers = append(servers, serverEntry{tcp4, "tcp4"})
+		}
+	}
+
+	// IPv6 listeners
+	if *addr6 != "" {
+		if udp6, err := newUDPServer(*addr6, "udp6"); err != nil {
+			log.Printf("udp6 listen failed on %s: %v", *addr6, err)
+		} else {
+			servers = append(servers, serverEntry{udp6, "udp6"})
+		}
+		if tcp6, err := newTCPServer(*addr6, "tcp6"); err != nil {
+			log.Printf("tcp6 listen failed on %s: %v", *addr6, err)
+		} else {
+			servers = append(servers, serverEntry{tcp6, "tcp6"})
+		}
+	}
+
+	if len(servers) == 0 {
+		log.Fatalf("no listeners started; check -addr4/-addr6")
+	}
+
+	type serverError struct {
+		label string
+		err   error
+	}
+
+	errCh := make(chan serverError, len(servers))
+	active := len(servers)
+
+	for _, s := range servers {
+		go func(se serverEntry) {
+			log.Printf("Starting DNS → mDNS bridge on %s (%s)", se.server.Addr, se.label)
+			if err := se.server.ActivateAndServe(); err != nil {
+				errCh <- serverError{label: se.label, err: err}
+			}
+		}(s)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	select {
-	case sig := <-sigCh:
-		log.Printf("Received signal %s, shutting down", sig)
-		cancelWarm()
-		if err := udpServer.Shutdown(); err != nil {
-			log.Printf("udp shutdown error: %v", err)
+	for {
+		select {
+		case sig := <-sigCh:
+			log.Printf("Received signal %s, shutting down", sig)
+			cancelWarm()
+			for _, s := range servers {
+				if err := s.server.Shutdown(); err != nil {
+					log.Printf("%s shutdown error: %v", s.label, err)
+				}
+			}
+			return
+		case srvErr := <-errCh:
+			log.Printf("server error (%s): %v", srvErr.label, srvErr.err)
+			active--
+			if active == 0 {
+				cancelWarm()
+				log.Fatalf("all listeners stopped")
+			}
 		}
-		if err := tcpServer.Shutdown(); err != nil {
-			log.Printf("tcp shutdown error: %v", err)
-		}
-	case err := <-errCh:
-		cancelWarm()
-		log.Fatalf("server error: %v", err)
 	}
 }

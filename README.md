@@ -1,5 +1,7 @@
 # mdnsbridge
 
+![Icon](icon-256.png)
+
 DNS → mDNS bridge for `.local` hostnames. It answers normal DNS queries by asking `avahi-daemon` (via `avahi-resolve`).
 
 This is handy when you want Bonjour names to work over Tailscale using **split-horizon DNS**.

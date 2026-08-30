@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -66,6 +67,167 @@ func (c *resolverCache) set(key string, ip net.IP, err error, ttl time.Duration)
 }
 
 var cache = newResolverCache()
+
+type tailscaleNode struct {
+	HostName     string
+	DNSName      string
+	TailscaleIPs []string
+}
+
+type tailscaleStatus struct {
+	Self tailscaleNode
+	Peer map[string]tailscaleNode
+}
+
+type tailscaleEntry struct {
+	DNSName string
+	IPs     []net.IP
+}
+
+type tailscaleCache struct {
+	mu      sync.RWMutex
+	entries map[string]tailscaleEntry
+	expires time.Time
+}
+
+var tsCache = &tailscaleCache{}
+
+func normalizeDNSName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name != "" && !strings.HasSuffix(name, ".") {
+		name += "."
+	}
+	return name
+}
+
+func localBaseName(name string) (string, bool) {
+	name = strings.ToLower(strings.TrimSuffix(name, "."))
+	if !strings.HasSuffix(name, ".local") {
+		return "", false
+	}
+	base := strings.TrimSuffix(name, ".local")
+	if base == "" || strings.Contains(base, ".") {
+		return "", false
+	}
+	return base, true
+}
+
+func addTailscaleNode(entries map[string]tailscaleEntry, n tailscaleNode) {
+	dnsName := normalizeDNSName(n.DNSName)
+	if dnsName == "" {
+		return
+	}
+	var ips []net.IP
+	for _, raw := range n.TailscaleIPs {
+		if ip := net.ParseIP(raw); ip != nil {
+			ips = append(ips, ip)
+		}
+	}
+	keys := map[string]bool{}
+	keys[dnsName] = true
+	keys[strings.TrimSuffix(dnsName, ".")] = true
+	if h := strings.ToLower(strings.TrimSpace(n.HostName)); h != "" {
+		keys[h] = true
+	}
+	first := strings.Split(strings.TrimSuffix(dnsName, "."), ".")[0]
+	if first != "" {
+		keys[first] = true
+	}
+	for key := range keys {
+		entries[key] = tailscaleEntry{DNSName: dnsName, IPs: ips}
+	}
+}
+
+func loadTailscaleEntries() map[string]tailscaleEntry {
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "tailscale", "status", "--json").Output()
+	if err != nil {
+		log.Printf("tailscale status lookup failed: %v", err)
+		return nil
+	}
+	var st tailscaleStatus
+	if err := json.Unmarshal(out, &st); err != nil {
+		log.Printf("tailscale status parse failed: %v", err)
+		return nil
+	}
+	entries := make(map[string]tailscaleEntry)
+	addTailscaleNode(entries, st.Self)
+	for _, n := range st.Peer {
+		addTailscaleNode(entries, n)
+	}
+	return entries
+}
+
+func tailscaleEntries() map[string]tailscaleEntry {
+	now := time.Now()
+	tsCache.mu.RLock()
+	if tsCache.entries != nil && now.Before(tsCache.expires) {
+		entries := tsCache.entries
+		tsCache.mu.RUnlock()
+		return entries
+	}
+	tsCache.mu.RUnlock()
+
+	entries := loadTailscaleEntries()
+	if entries == nil {
+		entries = map[string]tailscaleEntry{}
+	}
+	tsCache.mu.Lock()
+	tsCache.entries = entries
+	tsCache.expires = now.Add(10 * time.Second)
+	tsCache.mu.Unlock()
+	return entries
+}
+
+func tailscaleEntryForName(name string) (tailscaleEntry, bool, bool) {
+	if base, ok := localBaseName(name); ok {
+		entry, found := tailscaleEntries()[base]
+		return entry, found, true
+	}
+	key := normalizeDNSName(name)
+	entry, found := tailscaleEntries()[key]
+	if found {
+		return entry, true, false
+	}
+	entry, found = tailscaleEntries()[strings.TrimSuffix(key, ".")]
+	return entry, found, false
+}
+
+func appendTailscaleAddresses(msg *dns.Msg, owner string, qtype uint16, entry tailscaleEntry) {
+	for _, ip := range entry.IPs {
+		switch qtype {
+		case dns.TypeA, dns.TypeANY:
+			if ip4 := ip.To4(); ip4 != nil {
+				msg.Answer = append(msg.Answer, &dns.A{Hdr: dns.RR_Header{Name: owner, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: responseTTL}, A: ip4})
+			}
+		case dns.TypeAAAA:
+			if ip.To4() == nil {
+				msg.Answer = append(msg.Answer, &dns.AAAA{Hdr: dns.RR_Header{Name: owner, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: responseTTL}, AAAA: ip})
+			}
+		}
+	}
+}
+
+func addTailscaleRecordsForQuery(msg *dns.Msg, q dns.Question) bool {
+	entry, ok, fromLocal := tailscaleEntryForName(q.Name)
+	if !ok {
+		return false
+	}
+	if fromLocal {
+		msg.Answer = append(msg.Answer, &dns.CNAME{Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: responseTTL}, Target: entry.DNSName})
+		if q.Qtype != dns.TypeCNAME {
+			appendTailscaleAddresses(msg, entry.DNSName, q.Qtype, entry)
+		}
+		return true
+	}
+	// Direct MagicDNS/Tailscale-name query. Answer from tailscale status rather
+	// than recursing, so this remains safe even if tailnet DNS points at us.
+	if q.Qtype != dns.TypeCNAME {
+		appendTailscaleAddresses(msg, q.Name, q.Qtype, entry)
+	}
+	return len(msg.Answer) > 0 || q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeANY
+}
 
 func cacheKey(name string, qtype uint16) string {
 	return fmt.Sprintf("%s|%d", strings.ToLower(name), qtype)
@@ -168,6 +330,9 @@ func recordForIP(name string, qtype uint16, ip net.IP) (dns.RR, bool) {
 }
 
 func addRecordForQuery(msg *dns.Msg, q dns.Question) bool {
+	if _, ok := localBaseName(q.Name); !ok {
+		return false
+	}
 	ip, err := cachedResolve(q.Name, q.Qtype)
 	if err != nil {
 		log.Printf("mdns resolve failed for %s (%s): %v", q.Name, dns.TypeToString[q.Qtype], err)
@@ -189,11 +354,15 @@ func handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 	for _, q := range r.Question {
 		switch q.Qtype {
-		case dns.TypeA, dns.TypeAAAA:
-			if addRecordForQuery(msg, q) {
+		case dns.TypeA, dns.TypeAAAA, dns.TypeCNAME:
+			if addTailscaleRecordsForQuery(msg, q) || addRecordForQuery(msg, q) {
 				answered = true
 			}
 		case dns.TypeANY:
+			if addTailscaleRecordsForQuery(msg, q) {
+				answered = true
+				continue
+			}
 			a := dns.Question{Name: q.Name, Qtype: dns.TypeA, Qclass: q.Qclass}
 			aaaa := dns.Question{Name: q.Name, Qtype: dns.TypeAAAA, Qclass: q.Qclass}
 			// resolve A and AAAA in parallel

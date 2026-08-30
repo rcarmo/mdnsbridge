@@ -341,9 +341,22 @@ func mdnsNameExists(name string, requestedQtype uint16) bool {
 	return false
 }
 
-func addRecordForQuery(msg *dns.Msg, q dns.Question) bool {
+func usableRemoteIPv6(ip net.IP) bool {
+	return ip != nil && ip.To4() == nil && !ip.IsUnspecified() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsMulticast()
+}
+
+func hasUsableMDNSAAAA(name string) bool {
+	ip, err := cachedResolve(name, dns.TypeAAAA)
+	return err == nil && usableRemoteIPv6(ip)
+}
+
+func addRecordForQuery(msg *dns.Msg, q dns.Question, remoteTailscaleClient bool) bool {
 	if _, ok := localBaseName(q.Name); !ok {
 		return false
+	}
+	if remoteTailscaleClient && q.Qtype == dns.TypeA && hasUsableMDNSAAAA(q.Name) {
+		log.Printf("suppressing LAN IPv4 A record for Tailscale client; usable AAAA exists for %s", q.Name)
+		return true // NOERROR/NODATA instead of returning overlapping LAN IPv4.
 	}
 	ip, err := cachedResolve(q.Name, q.Qtype)
 	if err != nil {
@@ -363,15 +376,38 @@ func addRecordForQuery(msg *dns.Msg, q dns.Question) bool {
 	return true
 }
 
+func isTailscaleClientIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127
+	}
+	return strings.HasPrefix(strings.ToLower(ip.String()), "fd7a:115c:a1e0:")
+}
+
+func responseClientIP(w dns.ResponseWriter) net.IP {
+	addr := w.RemoteAddr()
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		return a.IP
+	case *net.TCPAddr:
+		return a.IP
+	default:
+		return nil
+	}
+}
+
 func handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 	msg := new(dns.Msg)
 	msg.SetReply(r)
 	answered := false
+	remoteTailscaleClient := isTailscaleClientIP(responseClientIP(w))
 
 	for _, q := range r.Question {
 		switch q.Qtype {
 		case dns.TypeA, dns.TypeAAAA, dns.TypeCNAME:
-			if addTailscaleRecordsForQuery(msg, q) || addRecordForQuery(msg, q) {
+			if addTailscaleRecordsForQuery(msg, q) || addRecordForQuery(msg, q, remoteTailscaleClient) {
 				answered = true
 			}
 		case dns.TypeANY:
@@ -389,6 +425,10 @@ func handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 			wg.Add(2)
 			go func() {
 				defer wg.Done()
+				if remoteTailscaleClient && hasUsableMDNSAAAA(a.Name) {
+					okA = true // NOERROR/NODATA for A when AAAA exists for remote Tailscale clients.
+					return
+				}
 				if ip, err := cachedResolveCtx(resolveCtx, a.Name, a.Qtype); err == nil {
 					if rr, ok := recordForIP(a.Name, a.Qtype, ip); ok {
 						mu.Lock()

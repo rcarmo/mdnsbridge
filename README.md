@@ -15,8 +15,9 @@ For each query, `mdnsbridge` now checks live Tailscale state first:
 1. If `host.local` matches a current Tailscale node hostname or MagicDNS label, it answers from `tailscale status --json`.
 2. It returns a `CNAME` from `host.local` to the node’s MagicDNS name, plus final `A` / `AAAA` records when available.
 3. If the query is already for a known MagicDNS name such as `host.tailnet.ts.net`, it answers directly from Tailscale state instead of recursing through DNS.
-4. Unknown single-label `.local` names fall back to Avahi/mDNS.
-5. Optionally, for clients querying from Tailscale address space, LAN IPv4 `A` answers can be suppressed when a usable mDNS `AAAA` exists. This is disabled by default.
+4. Unknown single-label `.local` names fall back to Avahi/mDNS through `avahi-resolve`.
+5. For Avahi-backed names, the bridge answers one address per requested family: one `A` for IPv4 lookups and one `AAAA` for IPv6 lookups, matching what `avahi-resolve -4/-6` returns.
+6. Optionally, for clients querying from Tailscale address space, LAN IPv4 `A` answers can be suppressed when a usable mDNS `AAAA` exists. This is disabled by default.
 
 ```mermaid
 flowchart LR
@@ -77,6 +78,8 @@ This avoids DNS loops. In some deployments Tailscale DNS or MagicDNS may itself 
 
 For unknown `.local` hosts resolved through Avahi, the default behavior is normal mDNS behavior for all clients: return `A` and/or `AAAA` records when Avahi provides them.
 
+The Avahi fallback is intentionally narrow: it resolves names, it does not browse and republish every advertised address. `mdnsbridge` runs `avahi-resolve -4 -n <name>` for `A` and `avahi-resolve -6 -n <name>` for `AAAA`, so the answer set is limited to the address Avahi returns for that lookup.
+
 There is an opt-in overlap-avoidance mode:
 
 ```bash
@@ -93,9 +96,30 @@ This mode is **off by default** because some clients still expect the LAN IPv4 a
 
 Multi-label `.local` names such as `service.example.com.local` are treated as search-suffix accidents and are not sent to Avahi/mDNS.
 
+## IPv6 address selection
+
+For Avahi-backed `AAAA` lookups, `mdnsbridge` forwards the IPv6 address returned by `avahi-resolve -6`. In practice that usually means one address, not the complete set of IPv6 addresses configured on the target host.
+
+This matters when a host has several IPv6 addresses:
+
+- If Avahi returns a globally scoped or ULA address, the bridge can return a useful remote `AAAA` answer.
+- If Avahi only returns a link-local `fe80::/10` address, that address is only valid on the local link and generally is not useful to remote Tailscale clients unless the client also has the right interface scope.
+- The optional IPv4 suppression mode only suppresses `A` records when the mDNS `AAAA` is usable remotely: not unspecified, loopback, link-local, or multicast.
+
+A quick check from the bridge host is:
+
+```bash
+avahi-resolve -4 -n printer.local
+avahi-resolve -6 -n printer.local
+```
+
+If the IPv6 answer starts with `fe80:`, the target is only advertising link-local IPv6 through the Avahi lookup path used by `mdnsbridge`. If the answer is global or ULA, the `AAAA` answer is suitable for remote clients subject to routing and firewall policy.
+
 ## Relationship to Avahi
 
 This requires you to have `avahi-daemon` running on the same node. `avahi-daemon` has a "reflector" mode, but that does not speak standard DNS--it only relays mDNS packets across interfaces (which Tailscale drops, so it's useless). This uses the `avahi-daemon` CLI tools to resolve unknown single-label `.local` names (because that is the simplest, easiest integration surface) and caches them, acting as a very simple DNS server.
+
+Because the bridge shells out to `avahi-resolve` instead of consuming the full mDNS cache over D-Bus, it follows Avahi's host-name resolution result rather than enumerating every interface address the target might publish. That keeps the bridge small and predictable, but it also means address selection should be debugged with `avahi-resolve -4/-6` on the bridge host.
 
 ## Build
 
@@ -144,6 +168,7 @@ ping printer.local
 
 - Needs `avahi-daemon` and `avahi-resolve` (`avahi-tools` / `avahi-utils`) for mDNS fallback.
 - Uses `tailscale status --json` when the `tailscale` CLI is available; if it is unavailable or times out, Tailscale matching is skipped and `.local` fallback still works.
+- Avahi-backed lookups return the address selected by `avahi-resolve -4` or `avahi-resolve -6`; they do not enumerate every address in the mDNS cache.
 - `-suppress-lan-ipv4-for-tailscale-clients` is available for overlap-avoidance but defaults to off.
 - Listens on IPv4 `:53` and IPv6 `[::]:53` by default (UDP + TCP).
 - Use `-addr4` or `-addr6` to override or disable a family (set empty to disable).

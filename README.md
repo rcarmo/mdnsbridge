@@ -4,7 +4,7 @@
 
 DNS → mDNS bridge for `.local` hostnames. It answers normal DNS queries by asking `avahi-daemon` (via `avahi-resolve`), with a Tailscale-aware fast path for hosts that are already present in `tailscale status --json`.
 
-This is handy when you want Bonjour names to work over Tailscale using **split-horizon DNS**, while still preferring live Tailscale addresses for machines that are part of your tailnet and avoiding overlapping LAN IPv4 answers for remote Tailscale clients when IPv6 is available.
+This is handy when you want Bonjour names to work over Tailscale using **split-horizon DNS**, while still preferring live Tailscale addresses for machines that are part of your tailnet.
 
 ## What it does
 
@@ -16,7 +16,7 @@ For each query, `mdnsbridge` now checks live Tailscale state first:
 2. It returns a `CNAME` from `host.local` to the node’s MagicDNS name, plus final `A` / `AAAA` records when available.
 3. If the query is already for a known MagicDNS name such as `host.tailnet.ts.net`, it answers directly from Tailscale state instead of recursing through DNS.
 4. Unknown single-label `.local` names fall back to Avahi/mDNS.
-5. For clients querying from Tailscale address space, LAN IPv4 `A` answers are suppressed when a usable mDNS `AAAA` exists, avoiding broken `192.168.x.x` answers on remote networks with overlapping private ranges.
+5. Optionally, for clients querying from Tailscale address space, LAN IPv4 `A` answers can be suppressed when a usable mDNS `AAAA` exists. This is disabled by default.
 
 ```mermaid
 flowchart LR
@@ -30,7 +30,8 @@ flowchart LR
     bridge -- "mDNS query<br/>printer.local" --> lan
     lan -- "mDNS answer<br/>A 192.168.1.50<br/>AAAA 2001:db8::50" --> bridge
     bridge -- "LAN answer<br/>A + AAAA" --> lanClient
-    bridge -- "Tailscale answer<br/>AAAA only when IPv6 exists<br/>(suppress overlapping LAN A)" --> tsClient
+    bridge -- "Default Tailscale answer<br/>A + AAAA" --> tsClient
+    bridge -. "Optional mode<br/>AAAA only when IPv6 exists<br/>(suppress overlapping LAN A)" .-> tsClient
 ```
 
 ## Why
@@ -54,6 +55,7 @@ flowchart TD
     tsanswer["Answer from Tailscale state<br/>- host.local gets CNAME<br/>- include Tailscale A/AAAA when reported<br/>- do not recurse into ts.net DNS"]
     single{"Unknown single-label .local?"}
     avahi["Fall back to Avahi/mDNS<br/>via avahi-resolve"]
+    optin{"IPv4 suppression option enabled?<br/>-suppress-lan-ipv4-for-tailscale-clients"}
     aquery{"A query from Tailscale client<br/>and usable mDNS AAAA exists?"}
     suppress["Return NOERROR/NODATA for A<br/>so remote clients avoid overlapping LAN IPv4"]
     mdnsanswer["Return mDNS answer<br/>LAN clients may receive A + AAAA"]
@@ -63,7 +65,9 @@ flowchart TD
     query --> source --> status --> known
     known -- "yes: host.local or host.tailnet.ts.net" --> tsanswer --> response
     known -- "no" --> single
-    single -- "yes" --> avahi --> aquery
+    single -- "yes" --> avahi --> optin
+    optin -- "yes" --> aquery
+    optin -- "no (default)" --> mdnsanswer --> response
     aquery -- "yes" --> suppress --> response
     aquery -- "no" --> mdnsanswer --> response
     single -- "no: e.g. service.example.com.local" --> accident --> response
@@ -71,12 +75,21 @@ flowchart TD
 
 This avoids DNS loops. In some deployments Tailscale DNS or MagicDNS may itself point at the bridge. For that reason, `mdnsbridge` does **not** resolve `*.ts.net` through DNS. It only answers known Tailscale names from the local `tailscale status --json` output. Unknown names are not forwarded to Tailscale DNS.
 
-For unknown `.local` hosts resolved through Avahi, answers are source-aware:
+For unknown `.local` hosts resolved through Avahi, the default behavior is normal mDNS behavior for all clients: return `A` and/or `AAAA` records when Avahi provides them.
 
-- LAN clients keep normal mDNS behavior and may receive both `A` and `AAAA` records.
+There is an opt-in overlap-avoidance mode:
+
+```bash
+mdnsbridge -suppress-lan-ipv4-for-tailscale-clients
+```
+
+When enabled:
+
 - Tailscale clients are detected by source address (`100.64.0.0/10` or `fd7a:115c:a1e0::/48`).
 - When a Tailscale client asks for `A` and a usable mDNS `AAAA` exists, the bridge returns `NOERROR` with no `A` records instead of returning a potentially wrong LAN `192.168.x.x` address.
-- This helps clients on remote networks that also use `192.168.1.0/24` prefer IPv6, Tailscale records, or CNAME/MagicDNS paths instead of trying an overlapping local subnet address.
+- This can help clients on remote networks that also use `192.168.1.0/24` prefer IPv6, Tailscale records, or CNAME/MagicDNS paths instead of trying an overlapping local subnet address.
+
+This mode is **off by default** because some clients still expect the LAN IPv4 answer, especially when an exit node or subnet route can make it reachable.
 
 Multi-label `.local` names such as `service.example.com.local` are treated as search-suffix accidents and are not sent to Avahi/mDNS.
 
@@ -131,6 +144,7 @@ ping printer.local
 
 - Needs `avahi-daemon` and `avahi-resolve` (`avahi-tools` / `avahi-utils`) for mDNS fallback.
 - Uses `tailscale status --json` when the `tailscale` CLI is available; if it is unavailable or times out, Tailscale matching is skipped and `.local` fallback still works.
+- `-suppress-lan-ipv4-for-tailscale-clients` is available for overlap-avoidance but defaults to off.
 - Listens on IPv4 `:53` and IPv6 `[::]:53` by default (UDP + TCP).
 - Use `-addr4` or `-addr6` to override or disable a family (set empty to disable).
 - `-addr` is deprecated; it maps to `-addr4` for backward compatibility.

@@ -68,6 +68,8 @@ func (c *resolverCache) set(key string, ip net.IP, err error, ttl time.Duration)
 
 var cache = newResolverCache()
 
+var suppressLANIPv4ForTailscaleClients bool
+
 type tailscaleNode struct {
 	HostName     string
 	DNSName      string
@@ -402,7 +404,7 @@ func handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 	msg := new(dns.Msg)
 	msg.SetReply(r)
 	answered := false
-	remoteTailscaleClient := isTailscaleClientIP(responseClientIP(w))
+	remoteTailscaleClient := suppressLANIPv4ForTailscaleClients && isTailscaleClientIP(responseClientIP(w))
 
 	for _, q := range r.Question {
 		switch q.Qtype {
@@ -508,7 +510,9 @@ func main() {
 	addr4 := flag.String("addr4", ":53", "listen address for IPv4 (udp4/tcp4); empty disables IPv4")
 	addr6 := flag.String("addr6", "[::]:53", "listen address for IPv6 (udp6/tcp6); empty disables IPv6")
 	warm := flag.Bool("warmup", true, "run avahi-browse warmup")
+	suppressLANIPv4 := flag.Bool("suppress-lan-ipv4-for-tailscale-clients", false, "for Tailscale client source addresses, return NOERROR/NODATA for mDNS A queries when a usable AAAA exists")
 	flag.Parse()
+	suppressLANIPv4ForTailscaleClients = *suppressLANIPv4
 
 	dns.HandleFunc(".", handleDNS)
 

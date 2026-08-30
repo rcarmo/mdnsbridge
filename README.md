@@ -2,13 +2,20 @@
 
 ![Icon](icon-256.png)
 
-DNS → mDNS bridge for `.local` hostnames. It answers normal DNS queries by asking `avahi-daemon` (via `avahi-resolve`).
+DNS → mDNS bridge for `.local` hostnames. It answers normal DNS queries by asking `avahi-daemon` (via `avahi-resolve`), with a Tailscale-aware fast path for hosts that are already present in `tailscale status --json`.
 
-This is handy when you want Bonjour names to work over Tailscale using **split-horizon DNS**.
+This is handy when you want Bonjour names to work over Tailscale using **split-horizon DNS**, while still preferring live Tailscale addresses for machines that are part of your tailnet.
 
 ## What it does
 
 Tailscale clients can’t see mDNS broadcasts on your LAN. Run `mdnsbridge` on an exit node (or subnet router) that _can_ see the LAN, and point Tailscale’s split DNS for `local` at it.
+
+For each query, `mdnsbridge` now checks live Tailscale state first:
+
+1. If `host.local` matches a current Tailscale node hostname or MagicDNS label, it answers from `tailscale status --json`.
+2. It returns a `CNAME` from `host.local` to the node’s MagicDNS name, plus final `A` / `AAAA` records when available.
+3. If the query is already for a known MagicDNS name such as `host.tailnet.ts.net`, it answers directly from Tailscale state instead of recursing through DNS.
+4. Only unknown single-label `.local` names fall back to Avahi/mDNS.
 
 ```plain
 ┌───────────┐    DNS query      ┌─────────────┐    mDNS query   ┌───────────────┐
@@ -26,9 +33,50 @@ I rely on `.local` hostnames and URLs when I'm at home, and wanted to be able to
 
 Applications that try to bypass OS name resolution and try to directly browse mDNS/Bonjour/Rendezvous won't work, because Tailscale does not bridge multicast packets. ZeroTier does, but I don't like its UX (which is why I switched to Tailscale in the first place).
 
+## Tailscale-first resolution
+
+The bridge treats Tailscale as the preferred source of truth for names that Tailscale already knows about.
+
+```plain
+Query arrives
+     │
+     ▼
+┌──────────────────────────────┐
+│ Is it a known Tailscale name? │◄──────┐
+│ - host.local                 │       │ cached for 10s
+│ - host.tailnet.ts.net        │       │ from `tailscale status --json`
+└───────────────┬──────────────┘       │
+        yes    │     no               │
+               ▼                      │
+┌──────────────────────────────┐       │
+│ Answer from Tailscale state  │       │
+│ - host.local gets CNAME      │       │
+│ - A/AAAA are included when   │       │
+│   Tailscale reports them     │       │
+│ - no recursive ts.net lookup │       │
+└───────────────┬──────────────┘       │
+                │                      │
+                ▼                      │
+             response                  │
+
+Unknown single-label .local query
+                │
+                ▼
+┌──────────────────────────────┐
+│ Fall back to Avahi/mDNS      │
+│ using avahi-resolve          │
+└───────────────┬──────────────┘
+                ▼
+             response
+```
+
+This avoids DNS loops. In some deployments Tailscale DNS or MagicDNS may itself point at the bridge. For that reason, `mdnsbridge` does **not** resolve `*.ts.net` through DNS. It only answers known Tailscale names from the local `tailscale status --json` output. Unknown names are not forwarded to Tailscale DNS.
+
+Multi-label `.local` names such as `service.example.com.local` are treated as search-suffix accidents and are not sent to Avahi/mDNS.
+
 ## Relationship to Avahi
 
-This requires you to have `avahi-daemon` running on the same node. `avahi-daemon` has a "reflector" mode, but that does not speak standard DNS--it only relays mDNS packets across interfaces (which Tailscale drops, so it's useless). This uses the `avahi-daemon` CLI tools to resolve `.local` names (because that is the simplest, easiest integration surface) and caches them, acting as a very simple DNS server.
+This requires you to have `avahi-daemon` running on the same node. `avahi-daemon` has a "reflector" mode, but that does not speak standard DNS--it only relays mDNS packets across interfaces (which Tailscale drops, so it's useless). This uses the `avahi-daemon` CLI tools to resolve unknown single-label `.local` names (because that is the simplest, easiest integration surface) and caches them, acting as a very simple DNS server.
 
 ## Build
 
@@ -75,14 +123,15 @@ ping printer.local
 
 ## Notes
 
-- Needs `avahi-daemon` and `avahi-resolve` (`avahi-tools` / `avahi-utils`).
+- Needs `avahi-daemon` and `avahi-resolve` (`avahi-tools` / `avahi-utils`) for mDNS fallback.
+- Uses `tailscale status --json` when the `tailscale` CLI is available; if it is unavailable or times out, Tailscale matching is skipped and `.local` fallback still works.
 - Listens on IPv4 `:53` and IPv6 `[::]:53` by default (UDP + TCP).
 - Use `-addr4` or `-addr6` to override or disable a family (set empty to disable).
 - `-addr` is deprecated; it maps to `-addr4` for backward compatibility.
 - Examples:
   - IPv4 only: `mdnsbridge -addr6 ""`
   - IPv6 only: `mdnsbridge -addr4 ""`
-- Caches results briefly (positive 5s, negative 2s).
+- Caches mDNS results briefly (positive 5s, negative 2s) and Tailscale status for 10s.
 - Runs `avahi-browse` on startup and every 5 minutes to refresh `avahi-daemon`.
 
 ## License

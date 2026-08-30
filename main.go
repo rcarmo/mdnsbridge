@@ -329,12 +329,28 @@ func recordForIP(name string, qtype uint16, ip net.IP) (dns.RR, bool) {
 	return nil, false
 }
 
+func mdnsNameExists(name string, requestedQtype uint16) bool {
+	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		if qtype == requestedQtype {
+			continue
+		}
+		if _, err := cachedResolve(name, qtype); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func addRecordForQuery(msg *dns.Msg, q dns.Question) bool {
 	if _, ok := localBaseName(q.Name); !ok {
 		return false
 	}
 	ip, err := cachedResolve(q.Name, q.Qtype)
 	if err != nil {
+		if mdnsNameExists(q.Name, q.Qtype) {
+			log.Printf("mdns name exists without %s record for %s", dns.TypeToString[q.Qtype], q.Name)
+			return true // NOERROR/NODATA rather than NXDOMAIN for this qtype.
+		}
 		log.Printf("mdns resolve failed for %s (%s): %v", q.Name, dns.TypeToString[q.Qtype], err)
 		return false
 	}

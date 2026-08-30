@@ -17,12 +17,16 @@ For each query, `mdnsbridge` now checks live Tailscale state first:
 3. If the query is already for a known MagicDNS name such as `host.tailnet.ts.net`, it answers directly from Tailscale state instead of recursing through DNS.
 4. Only unknown single-label `.local` names fall back to Avahi/mDNS.
 
-```plain
-┌───────────┐    DNS query      ┌─────────────┐    mDNS query   ┌───────────────┐
-│ Tailscale │──────────────────>│ mdnsbridge  │────────────────>│ LAN device    │
-│ client    │   printer.local   │ (exit node) │   printer.local │ (printer/NAS) │
-│           │<──────────────────│             │<────────────────│               │
-└───────────┘    192.168.1.50   └─────────────┘   192.168.1.50  └───────────────┘
+```mermaid
+flowchart LR
+    client["Tailscale client"]
+    bridge["mdnsbridge<br/>(exit node or subnet router)"]
+    lan["LAN device<br/>(printer / NAS / service)"]
+
+    client -- "DNS query<br/>printer.local" --> bridge
+    bridge -- "mDNS query<br/>printer.local" --> lan
+    lan -- "mDNS answer<br/>192.168.1.50" --> bridge
+    bridge -- "DNS answer<br/>192.168.1.50" --> client
 ```
 
 ## Why
@@ -37,37 +41,22 @@ Applications that try to bypass OS name resolution and try to directly browse mD
 
 The bridge treats Tailscale as the preferred source of truth for names that Tailscale already knows about.
 
-```plain
-Query arrives
-     │
-     ▼
-┌──────────────────────────────┐
-│ Is it a known Tailscale name? │◄──────┐
-│ - host.local                 │       │ cached for 10s
-│ - host.tailnet.ts.net        │       │ from `tailscale status --json`
-└───────────────┬──────────────┘       │
-        yes    │     no               │
-               ▼                      │
-┌──────────────────────────────┐       │
-│ Answer from Tailscale state  │       │
-│ - host.local gets CNAME      │       │
-│ - A/AAAA are included when   │       │
-│   Tailscale reports them     │       │
-│ - no recursive ts.net lookup │       │
-└───────────────┬──────────────┘       │
-                │                      │
-                ▼                      │
-             response                  │
+```mermaid
+flowchart TD
+    query["DNS query arrives"]
+    status["Read cached Tailscale status<br/>(refresh from tailscale status --json every 10s)"]
+    known{"Known Tailscale name?"}
+    tsanswer["Answer from Tailscale state<br/>- host.local gets CNAME<br/>- include A/AAAA when reported<br/>- do not recurse into ts.net DNS"]
+    single{"Unknown single-label .local?"}
+    avahi["Fall back to Avahi/mDNS<br/>via avahi-resolve"]
+    accident["Treat as search-suffix accident<br/>or unsupported name"]
+    response["Return DNS response"]
 
-Unknown single-label .local query
-                │
-                ▼
-┌──────────────────────────────┐
-│ Fall back to Avahi/mDNS      │
-│ using avahi-resolve          │
-└───────────────┬──────────────┘
-                ▼
-             response
+    query --> status --> known
+    known -- "yes: host.local or host.tailnet.ts.net" --> tsanswer --> response
+    known -- "no" --> single
+    single -- "yes" --> avahi --> response
+    single -- "no: e.g. service.example.com.local" --> accident --> response
 ```
 
 This avoids DNS loops. In some deployments Tailscale DNS or MagicDNS may itself point at the bridge. For that reason, `mdnsbridge` does **not** resolve `*.ts.net` through DNS. It only answers known Tailscale names from the local `tailscale status --json` output. Unknown names are not forwarded to Tailscale DNS.
